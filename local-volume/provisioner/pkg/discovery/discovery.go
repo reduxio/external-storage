@@ -20,7 +20,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/golang/glog"
@@ -34,6 +36,12 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
+const(
+	REDUXIO_BLOCK_DEVICE_VENDOR_KEY_WORD = "reduxio"
+)
+
+type empty struct{}
+
 // Discoverer finds available volumes and creates PVs for them
 // It looks for volumes in the directories specified in the discoveryMap
 type Discoverer struct {
@@ -45,6 +53,8 @@ type Discoverer struct {
 	nodeAffinityAnn string
 	nodeAffinity    *v1.VolumeNodeAffinity
 	classLister     storagev1listers.StorageClassLister
+	errorMsgCache   map[string]empty //been used to avoid 'dirty' logs
+	bootDevicePath  string
 }
 
 // NewDiscoverer creates a Discoverer object that will scan through
@@ -67,6 +77,11 @@ func NewDiscoverer(config *common.RuntimeConfig, cleanupTracker *deleter.Cleanup
 		}
 	}
 
+	bootDevicePath, err := getBootDevicePath()
+	if err !=nil {
+		return nil, fmt.Errorf("Failed to get boot device path: %v", err)
+	}
+
 	if config.UseAlphaAPI {
 		nodeAffinity, err := generateNodeAffinity(config.Node)
 		if err != nil {
@@ -77,12 +92,15 @@ func NewDiscoverer(config *common.RuntimeConfig, cleanupTracker *deleter.Cleanup
 		if err != nil {
 			return nil, fmt.Errorf("Failed to convert node affinity to alpha annotation: %v", err)
 		}
+
 		return &Discoverer{
 			RuntimeConfig:   config,
 			Labels:          labelMap,
 			CleanupTracker:  cleanupTracker,
 			classLister:     sharedInformer.Lister(),
-			nodeAffinityAnn: tmpAnnotations[common.AlphaStorageNodeAffinityAnnotation]}, nil
+			nodeAffinityAnn: tmpAnnotations[common.AlphaStorageNodeAffinityAnnotation],
+			errorMsgCache:   make(map[string]empty),
+			bootDevicePath:  bootDevicePath}, nil
 	}
 
 	volumeNodeAffinity, err := generateVolumeNodeAffinity(config.Node)
@@ -95,7 +113,24 @@ func NewDiscoverer(config *common.RuntimeConfig, cleanupTracker *deleter.Cleanup
 		Labels:         labelMap,
 		CleanupTracker: cleanupTracker,
 		classLister:    sharedInformer.Lister(),
-		nodeAffinity:   volumeNodeAffinity}, nil
+		nodeAffinity:   volumeNodeAffinity,
+		errorMsgCache:   make(map[string]empty),
+		bootDevicePath:  bootDevicePath}, nil
+}
+
+func getBootDevicePath() (bootDevicePath string, err error) {
+	bootDeviceUuid := getBootDeviceUuid()
+	return filepath.EvalSymlinks("/dev/disk/by-uuid/" + bootDeviceUuid)
+}
+
+func getBootDeviceUuid() string {
+	procCmdLineFilePath := "/proc/cmdline"
+	fileAsBytes, err := ioutil.ReadFile(procCmdLineFilePath)
+	if err != nil {
+		glog.Fatalf("ERROR when trying to read file %s. Error:\n%v", procCmdLineFilePath, err)
+	}
+	strAfterUuid := strings.Split(string(fileAsBytes), "UUID=")[1]
+	return strings.Split(strAfterUuid, " ")[0]
 }
 
 func generateNodeAffinity(node *v1.Node) (*v1.NodeAffinity, error) {
@@ -195,7 +230,6 @@ func (d *Discoverer) discoverVolumesAtPath(class string, config common.MountConf
 		return
 	}
 	// Put mount moints into set for faster checks below
-	type empty struct{}
 	mountPointMap := make(map[string]empty)
 	for _, mp := range mountPoints {
 		mountPointMap[mp.Path] = empty{}
@@ -220,6 +254,10 @@ func (d *Discoverer) discoverVolumesAtPath(class string, config common.MountConf
 				glog.Errorf(errStr)
 				d.Recorder.Eventf(pv, v1.EventTypeWarning, common.EventVolumeFailedDelete, errStr)
 			}
+			continue
+		}
+
+		if !d.isFilePathFulfillUserConstraints(filePath) {
 			continue
 		}
 
@@ -258,6 +296,76 @@ func (d *Discoverer) discoverVolumesAtPath(class string, config common.MountConf
 
 		d.createPV(file, class, reclaimPolicy, config, capacityByte, volMode, startTime)
 	}
+}
+
+func (d *Discoverer) isFilePathFulfillUserConstraints(filePath string) bool {
+	//check if file is sym link to boot device
+	fileSymlinkPath, err := filepath.EvalSymlinks(filePath)
+	errMsg := fmt.Sprintf("Error while trying to get symlink for file=%s. Error:\n%v", filePath, err)
+	if err !=nil {
+		glog.Infof(errMsg)
+		d.errorMsgCache[errMsg] = empty{}
+		return false
+	} else {
+		delete(d.errorMsgCache, errMsg)
+	}
+	errMsg = fmt.Sprintf("Found boot device in filePath=%s with fileSymlinkPath=%s. NOT creating a pv for it", filePath, fileSymlinkPath)
+	if strings.Contains(d.bootDevicePath, fileSymlinkPath) {
+		if _, exists := d.errorMsgCache[errMsg] ; !exists {
+			glog.Infof(errMsg)
+			d.errorMsgCache[errMsg] = empty{}
+		}
+		return false
+	} else {
+		delete(d.errorMsgCache, errMsg)
+	}
+
+	//check if file is wwifLinkPath
+	errMsg = fmt.Sprintf("filePath=%s with fileSymlinkPath=%s is NOT a wwid Path. NOT creating a pv for it", filePath, fileSymlinkPath)
+	if !d.isWwidLinkPath(filePath, fileSymlinkPath) {
+		if _, exists := d.errorMsgCache[errMsg] ; !exists {
+			glog.Infof(errMsg)
+			d.errorMsgCache[errMsg] = empty{}
+		}
+		return false
+	} else {
+		delete(d.errorMsgCache, errMsg)
+	}
+
+	//check if the device pointed by the file path is under user black list
+	errMsg = fmt.Sprintf("filePath=%s with fileSymlinkPath=%s is a vendor black list path. NOT creating a pv for it", filePath, fileSymlinkPath)
+	if d.isVendorBlackListedDevice(fileSymlinkPath) {
+		if _, exists := d.errorMsgCache[errMsg] ; !exists {
+			glog.Infof(errMsg)
+			d.errorMsgCache[errMsg] = empty{}
+		}
+		return false
+	} else {
+		delete(d.errorMsgCache, errMsg)
+	}
+	return true
+}
+
+func (d *Discoverer) isWwidLinkPath(fullFilePath string, deviceFullPath string) bool {
+	splitedFileSymLinkPath := strings.Split(deviceFullPath, "/")
+	nameOfBlockDevice := splitedFileSymLinkPath[len(splitedFileSymLinkPath) - 1]
+	wwidAsBytes, err := ioutil.ReadFile("/sys/block/" + nameOfBlockDevice + "/wwid")
+	if err != nil {
+		return false
+	}
+	wwid := strings.TrimSpace(string(wwidAsBytes))
+	return strings.HasSuffix(fullFilePath, wwid)
+}
+
+func (d *Discoverer) isVendorBlackListedDevice(deviceFullPath string) bool {
+	splitedFileSymLinkPath := strings.Split(deviceFullPath, "/")
+	nameOfBlockDevice := splitedFileSymLinkPath[len(splitedFileSymLinkPath) - 1]
+	subsysnqnAsBytes, err := ioutil.ReadFile("/sys/block/" + nameOfBlockDevice + "/device/subsysnqn")
+	if err != nil {
+		return false
+	}
+	subsysnqn := strings.TrimSpace(string(subsysnqnAsBytes))
+	return strings.Contains(subsysnqn, REDUXIO_BLOCK_DEVICE_VENDOR_KEY_WORD)
 }
 
 func (d *Discoverer) getVolumeMode(fullPath string) (v1.PersistentVolumeMode, error) {
