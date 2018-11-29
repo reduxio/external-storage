@@ -12,40 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ifeq ($(REGISTRY),)
-	REGISTRY = quay.io/external_storage/
-endif
 
-ifeq ($(VERSION),)
-	VERSION = latest
-endif
+REGISTRY = quay.io/reduxio
+VERSION = latest
+IMAGE = $(REGISTRY)/local-volume-provisioner:$(VERSION)
 
-IMAGE = $(REGISTRY)local-volume-provisioner:$(VERSION)
-MUTABLE_IMAGE = $(REGISTRY)local-volume-provisioner:latest
 
-all build:
+.PHONY: all
+all:
+	go get -v -d ./cmd
 	CGO_ENABLED=0 GOOS=linux go build -a -ldflags '-extldflags "-static"' -o local-volume-provisioner ./cmd
-.PHONY: all build
 
-container: build quick-container
-.PHONY: container
 
-quick-container:
+.PHONY: image
+image:
 	cp local-volume-provisioner deployment/docker
-	docker build -t $(MUTABLE_IMAGE) deployment/docker
-	docker tag $(MUTABLE_IMAGE) $(IMAGE)
-.PHONY: quick-container
+	sudo docker login -u="reduxio+buzi" -p="PVHGFW9YERAOPYCNXKC8FJMGLQ0EN9S2O2UX5R01G3V86W714MZ65Q5FGJHN6EOF" quay.io
+	@echo "Building image"
+	sudo docker build -t $(IMAGE) deployment/docker
+	@echo Pushing image
+	sudo docker push $(IMAGE)
+	@echo Image was pushed successfully
 
-push: container
-	docker push $(IMAGE)
-	docker push $(MUTABLE_IMAGE)
-.PHONY: push
-
-test:
-	go test ./...
-.PHONY: test
-
+.PHONY: clean
 clean:
 	rm -f local-volume-provisioner
 	rm -f deployment/docker/local-volume-provisioner
-.PHONY: clean
+	go clean -cache -r -i
