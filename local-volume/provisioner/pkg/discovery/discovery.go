@@ -37,7 +37,8 @@ import (
 )
 
 const(
-	REDUXIO_BLOCK_DEVICE_VENDOR_KEY_WORD = "reduxio"
+	ReduxioBlockDeviceVendorKeyWord = "reduxio"
+	PvNamePrefix                    = "magellan-internal-pv"
 )
 
 type empty struct{}
@@ -119,18 +120,21 @@ func NewDiscoverer(config *common.RuntimeConfig, cleanupTracker *deleter.Cleanup
 }
 
 func getBootDevicePath() (bootDevicePath string, err error) {
-	bootDeviceUuid := getBootDeviceUuid()
-	return filepath.EvalSymlinks("/dev/disk/by-uuid/" + bootDeviceUuid)
-}
-
-func getBootDeviceUuid() string {
 	procCmdLineFilePath := "/proc/cmdline"
 	fileAsBytes, err := ioutil.ReadFile(procCmdLineFilePath)
 	if err != nil {
 		glog.Fatalf("ERROR when trying to read file %s. Error:\n%v", procCmdLineFilePath, err)
 	}
-	strAfterUuid := strings.Split(string(fileAsBytes), "UUID=")[1]
-	return strings.Split(strAfterUuid, " ")[0]
+	fileStr := string(fileAsBytes)
+	strToSplitBy := "UUID="
+	devDiskPostfix := "by-uuid/"
+	if strings.Contains(fileStr, "PARTUUID=") {
+		strToSplitBy = "PARTUUID="
+		devDiskPostfix = "by-partuuid/"
+	}
+	strAfterId := strings.Split(fileStr, strToSplitBy)[1]
+	bootDeviceId := strings.Split(strAfterId, " ")[0]
+	return filepath.EvalSymlinks("/dev/disk/" + devDiskPostfix + bootDeviceId)
 }
 
 func generateNodeAffinity(node *v1.Node) (*v1.NodeAffinity, error) {
@@ -365,7 +369,7 @@ func (d *Discoverer) isVendorBlackListedDevice(deviceFullPath string) bool {
 		return false
 	}
 	subsysnqn := strings.TrimSpace(string(subsysnqnAsBytes))
-	return strings.Contains(subsysnqn, REDUXIO_BLOCK_DEVICE_VENDOR_KEY_WORD)
+	return strings.Contains(subsysnqn, ReduxioBlockDeviceVendorKeyWord)
 }
 
 func (d *Discoverer) getVolumeMode(fullPath string) (v1.PersistentVolumeMode, error) {
@@ -396,7 +400,7 @@ func generatePVName(file, node, class string) string {
 	h.Write([]byte(node))
 	h.Write([]byte(class))
 	// This is the FNV-1a 32-bit hash
-	return fmt.Sprintf("local-pv-%x", h.Sum32())
+	return fmt.Sprintf("%s-%x", PvNamePrefix, h.Sum32())
 }
 
 func (d *Discoverer) createPV(file, class string, reclaimPolicy v1.PersistentVolumeReclaimPolicy, config common.MountConfig, capacityByte int64, volMode v1.PersistentVolumeMode, startTime time.Time) {
@@ -424,6 +428,7 @@ func (d *Discoverer) createPV(file, class string, reclaimPolicy v1.PersistentVol
 		localPVConfig.NodeAffinity = d.nodeAffinity
 	}
 
+	localPVConfig.Labels["type"] = PvNamePrefix
 	pvSpec := common.CreateLocalPVSpec(localPVConfig)
 
 	_, err := d.APIUtil.CreatePV(pvSpec)
